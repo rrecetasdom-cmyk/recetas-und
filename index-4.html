@@ -1,0 +1,941 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Recetas UHD — Hospital Dr. E. Torres G.</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<script type="module">
+import { initializeApp }        from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+import { getFirestore, collection, addDoc, updateDoc, deleteDoc, doc, onSnapshot, query, orderBy, serverTimestamp, where, getDocs }
+                                from "https://www.gstatic.com/firebasejs/10.12.0/firebase-firestore.js";
+import { getAuth, signInWithEmailAndPassword, signOut, onAuthStateChanged, updatePassword, EmailAuthProvider, reauthenticateWithCredential }
+                                from "https://www.gstatic.com/firebasejs/10.12.0/firebase-auth.js";
+
+const firebaseConfig = {
+  apiKey:            "AIzaSyDkuL6G6uOxPXempC_PKh9PbI7WI1FRcKU",
+  authDomain:        "recetasuhd.firebaseapp.com",
+  projectId:         "recetasuhd",
+  storageBucket:     "recetasuhd.firebasestorage.app",
+  messagingSenderId: "454356243626",
+  appId:             "1:454356243626:web:f62d59b90cc941f5c26cd3"
+};
+
+const app  = initializeApp(firebaseConfig);
+const db   = getFirestore(app);
+const auth = getAuth(app);
+
+// ── ROLES Y USUARIOS ──────────────────────────────────────────────
+// Contraseña inicial para todos: UHD2026*
+// Cada usuario puede cambiarla desde su perfil
+const ROLES = {
+  "admin@recetasuhd.cl":       { role:"admin", nombre:"Administrador UHD",  tipo:"admin" },
+  "farmacia@recetasuhd.cl":    { role:"staff", nombre:"Farmacia UHD",       tipo:"staff" },
+  "enfermeria@recetasuhd.cl":  { role:"staff", nombre:"Enfermería UHD",     tipo:"staff" },
+  "rodriguez@recetasuhd.cl":   { role:"staff", nombre:"Dr. Rodríguez",      tipo:"medico" },
+  "duke@recetasuhd.cl":        { role:"staff", nombre:"Dra. Duke",          tipo:"medico" },
+  "medina@recetasuhd.cl":      { role:"staff", nombre:"Dr. Medina",         tipo:"medico" },
+  "gino@recetasuhd.cl":        { role:"staff", nombre:"Dr. Gino",           tipo:"medico" },
+  "cedeno@recetasuhd.cl":      { role:"staff", nombre:"Dra. Cedeño",        tipo:"medico" },
+  "garces@recetasuhd.cl":      { role:"staff", nombre:"Dr. Garcés",         tipo:"medico" },
+  "leandro@recetasuhd.cl":     { role:"staff", nombre:"Dr. Leandro",        tipo:"medico" },
+  "sequeda@recetasuhd.cl":     { role:"staff", nombre:"Dr. Sequeda",        tipo:"medico" },
+  "pacheco@recetasuhd.cl":     { role:"staff", nombre:"Dr. Pacheco",        tipo:"medico" },
+};
+
+window.recetas  = [];
+window.session  = null;
+window.selId    = null;
+window.db       = db;
+window.auth     = auth;
+let unsubscribe = null;
+
+// ── AUTH STATE ─────────────────────────────────────────────────────
+onAuthStateChanged(auth, (user) => {
+  if (user) {
+    const perfil = ROLES[user.email] || { role:"staff", nombre:user.email, tipo:"staff" };
+    window.session = { ...perfil, email:user.email, uid:user.uid };
+    mostrarApp();
+    iniciarSync();
+  } else {
+    window.session = null;
+    if (unsubscribe) { unsubscribe(); unsubscribe = null; }
+    mostrarLogin();
+  }
+});
+
+function mostrarLogin() {
+  document.getElementById("login-screen").style.display = "flex";
+  document.getElementById("app-wrap").style.display     = "none";
+  document.getElementById("l-email").value = "";
+  document.getElementById("l-pass").value  = "";
+  document.getElementById("l-err").style.display = "none";
+}
+
+function mostrarApp() {
+  document.getElementById("login-screen").style.display = "none";
+  document.getElementById("app-wrap").style.display     = "flex";
+  document.getElementById("sb-avatar").textContent = window.session.nombre[0];
+  document.getElementById("sb-name").textContent   = window.session.nombre;
+  document.getElementById("sb-role").textContent   = window.session.role==="admin" ? "⚙ Admin" : "👤 " + window.session.tipo;
+  document.getElementById("sb-email").textContent  = window.session.email;
+  document.getElementById("nav-admin").style.display = window.session.role==="admin" ? "flex":"none";
+  document.getElementById("dash-fecha").textContent =
+    "Hoy: "+new Date().toLocaleDateString("es-CL",{weekday:"long",year:"numeric",month:"long",day:"numeric"});
+}
+
+// ── LOGIN ──────────────────────────────────────────────────────────
+window.doLogin = async function() {
+  const email = document.getElementById("l-email").value.trim();
+  const pass  = document.getElementById("l-pass").value;
+  const err   = document.getElementById("l-err");
+  const btn   = document.getElementById("l-btn");
+  err.style.display = "none";
+  if (!email||!pass) { err.textContent="Completa todos los campos"; err.style.display="block"; return; }
+  btn.textContent="Ingresando..."; btn.disabled=true;
+  try {
+    await signInWithEmailAndPassword(auth, email, pass);
+  } catch(e) {
+    let msg = "Correo o contraseña incorrectos";
+    if (e.code==="auth/too-many-requests") msg="Demasiados intentos. Espera unos minutos.";
+    err.textContent=msg; err.style.display="block";
+    btn.textContent="Ingresar al sistema"; btn.disabled=false;
+  }
+};
+
+window.doLogout = async function() {
+  if (confirm("¿Cerrar sesión?")) await signOut(auth);
+};
+
+// ── CAMBIAR CONTRASEÑA ─────────────────────────────────────────────
+window.cambiarPassword = async function() {
+  const actual = document.getElementById("pw-actual").value;
+  const nueva  = document.getElementById("pw-nueva").value;
+  const conf   = document.getElementById("pw-confirmar").value;
+  const err    = document.getElementById("pw-err");
+  const ok     = document.getElementById("pw-ok");
+  err.style.display="none"; ok.style.display="none";
+  if (!actual||!nueva||!conf) { err.textContent="Completa todos los campos"; err.style.display="block"; return; }
+  if (nueva!==conf)           { err.textContent="Las contraseñas no coinciden"; err.style.display="block"; return; }
+  if (nueva.length<8)         { err.textContent="Mínimo 8 caracteres"; err.style.display="block"; return; }
+  try {
+    const cred = EmailAuthProvider.credential(auth.currentUser.email, actual);
+    await reauthenticateWithCredential(auth.currentUser, cred);
+    await updatePassword(auth.currentUser, nueva);
+    ok.textContent="✅ Contraseña cambiada correctamente"; ok.style.display="block";
+    document.getElementById("pw-actual").value="";
+    document.getElementById("pw-nueva").value="";
+    document.getElementById("pw-confirmar").value="";
+  } catch(e) {
+    let msg="Error al cambiar contraseña";
+    if (e.code==="auth/wrong-password") msg="Contraseña actual incorrecta";
+    err.textContent=msg; err.style.display="block";
+  }
+};
+
+// ── SYNC FIRESTORE ─────────────────────────────────────────────────
+function iniciarSync() {
+  if (unsubscribe) unsubscribe();
+  setSyncStatus("conectando");
+  const q = query(collection(db,"recetas"), orderBy("fechaRegistroTs","desc"));
+  unsubscribe = onSnapshot(q, (snap) => {
+    window.recetas = snap.docs.map(d=>({...d.data(), _docId:d.id}));
+    actualizarFechasSelector();
+    updateNavCount();
+    renderDash();
+    if (document.getElementById("v-recetas").style.display!=="none") renderTabla();
+    setSyncStatus("online");
+  }, () => setSyncStatus("offline"));
+}
+
+function setSyncStatus(e) {
+  const el=document.getElementById("sync-status"); if(!el) return;
+  const m={online:["● Sincronizado","#16A34A"],offline:["● Sin conexión","#DC2626"],conectando:["● Conectando...","#F59E0B"]};
+  el.textContent=m[e][0]; el.style.color=m[e][1];
+}
+
+// ── GUARDAR RECETA ─────────────────────────────────────────────────
+window.guardarReceta = async function(receta) {
+  // Verificar duplicado por N° Indicación
+  const existe = window.recetas.find(r => r.numeroIndicacion === receta.numeroIndicacion && receta.numeroIndicacion !== "—");
+  if (existe) {
+    showToast("⚠️ Indicación #"+receta.numeroIndicacion+" ya existe en el sistema","warn");
+    return false;
+  }
+  try {
+    await addDoc(collection(db,"recetas"), {...receta, fechaRegistroTs:serverTimestamp()});
+    return true;
+  } catch(e) {
+    console.error("Error guardando:",e);
+    showToast("Error al guardar en Firebase","warn");
+    return false;
+  }
+};
+
+// ── CAMBIAR ESTADO ─────────────────────────────────────────────────
+window.cambiarEstado = async function(id, estado) {
+  const r=window.recetas.find(x=>x.id===id); if(!r?._docId) return;
+  try {
+    await updateDoc(doc(db,"recetas",r._docId), {
+      estado,
+      ultimaModificacion: new Date().toISOString(),
+      modificadoPor: window.session?.email
+    });
+    showToast("Estado → "+estado);
+  } catch(e) { showToast("Error al actualizar","warn"); }
+};
+
+// ── GUARDAR OBSERVACIÓN ────────────────────────────────────────────
+window.guardarObservacion = async function(id, obs) {
+  const r=window.recetas.find(x=>x.id===id); if(!r?._docId) return;
+  try {
+    await updateDoc(doc(db,"recetas",r._docId), {
+      observaciones: obs,
+      ultimaModificacion: new Date().toISOString(),
+      modificadoPor: window.session?.email
+    });
+    showToast("✅ Observación guardada");
+  } catch(e) { showToast("Error al guardar observación","warn"); }
+};
+
+// ── ELIMINAR ───────────────────────────────────────────────────────
+window.eliminar = async function(id) {
+  if (window.session?.role!=="admin") { showToast("Solo el admin puede eliminar","warn"); return; }
+  if (!confirm("¿Eliminar esta receta? Esta acción no se puede deshacer.")) return;
+  const r=window.recetas.find(x=>x.id===id); if(!r?._docId) return;
+  try {
+    await deleteDoc(doc(db,"recetas",r._docId));
+    window.selId=null;
+    document.getElementById("detalle-panel").style.display="none";
+    showToast("Receta eliminada","warn");
+  } catch(e) { showToast("Error al eliminar","warn"); }
+};
+
+// ── EXPORTAR ───────────────────────────────────────────────────────
+window.exportarJSON = function() {
+  if (window.session?.role!=="admin") { showToast("Solo el admin puede exportar","warn"); return; }
+  const data=JSON.stringify(window.recetas.map(({_docId,...r})=>r),null,2);
+  const a=document.createElement("a");
+  a.href=URL.createObjectURL(new Blob([data],{type:"application/json"}));
+  a.download="respaldo_recetas_"+new Date().toLocaleDateString("es-CL").replace(/\//g,"-")+".json";
+  a.click();
+  showToast("✅ Respaldo exportado");
+};
+
+window.db=db; window.auth=auth;
+</script>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:Georgia,serif;background:#F1F5F9}
+#app-wrap{display:none;height:100vh;overflow:hidden;flex-direction:row}
+#sidebar{width:220px;background:#1e3a5f;display:flex;flex-direction:column;flex-shrink:0}
+.brand{display:flex;align-items:center;gap:10px;padding:16px 14px;border-bottom:1px solid rgba(255,255,255,.1)}
+.brand-title{color:#fff;font-weight:700;font-size:14px}.brand-sub{color:rgba(255,255,255,.4);font-size:10px}
+nav{flex:1;padding:10px 8px;display:flex;flex-direction:column;gap:3px}
+.nav-btn{display:flex;align-items:center;gap:8px;padding:9px 12px;border-radius:8px;border:none;background:transparent;color:rgba(255,255,255,.65);cursor:pointer;font-size:13px;font-family:inherit;text-align:left;width:100%}
+.nav-btn:hover{background:rgba(255,255,255,.1);color:#fff}
+.nav-btn.active{background:rgba(255,255,255,.18);color:#fff;font-weight:600}
+.nav-count{margin-left:auto;background:#2E6DA4;color:#fff;border-radius:20px;padding:1px 7px;font-size:10px;font-weight:700}
+#sync-bar{padding:5px 12px;font-size:10px;border-top:1px solid rgba(255,255,255,.08);text-align:center}
+#sync-status{font-weight:600;color:#FCD34D}
+.sidebar-bottom{padding:10px 12px 14px;border-top:1px solid rgba(255,255,255,.1)}
+.user-info{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.avatar{width:32px;height:32px;border-radius:50%;background:#2E6DA4;color:#fff;display:flex;align-items:center;justify-content:center;font-weight:700;font-size:14px;flex-shrink:0}
+.user-name{color:#fff;font-size:12px;font-weight:600}.user-role{color:rgba(255,255,255,.5);font-size:10px}
+.user-email{color:rgba(255,255,255,.3);font-size:9px;margin-top:1px;word-break:break-all}
+.logout-btn{width:100%;padding:7px;background:rgba(255,255,255,.07);border:none;color:rgba(255,255,255,.6);border-radius:6px;cursor:pointer;font-size:12px;font-family:inherit;margin-bottom:6px}
+.logout-btn:hover{background:rgba(255,255,255,.15);color:#fff}
+.pw-btn{width:100%;padding:6px;background:transparent;border:1px solid rgba(255,255,255,.2);color:rgba(255,255,255,.5);border-radius:6px;cursor:pointer;font-size:11px;font-family:inherit}
+.pw-btn:hover{border-color:rgba(255,255,255,.5);color:#fff}
+#main{flex:1;overflow-y:auto;padding:22px 26px}
+h1{font-size:22px;font-weight:700;color:#1e3a5f;margin-bottom:4px}
+.sub{color:#6B7280;font-size:13px;margin-bottom:18px}
+.stats-grid{display:grid;grid-template-columns:repeat(5,1fr);gap:12px;margin-bottom:22px}
+.stat-card{background:#fff;border-radius:12px;padding:16px;box-shadow:0 1px 3px rgba(0,0,0,.08);transition:transform .1s}
+.stat-card:hover{transform:translateY(-1px)}
+.stat-icon{font-size:22px;margin-bottom:6px}.stat-val{font-size:26px;font-weight:700;line-height:1.1}
+.stat-label{font-size:11px;color:#6B7280;margin-top:3px}
+.btn{padding:9px 18px;background:#1e3a5f;color:#fff;border:none;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;font-family:inherit;transition:background .15s}
+.btn:hover{background:#2E6DA4}.btn:disabled{opacity:.5;cursor:not-allowed}
+.btn-light{background:#F3F4F6;color:#374151;border:1px solid #D1D5DB}.btn-light:hover{background:#E5E7EB;border-color:#9CA3AF}
+.btn-green{background:#198754}.btn-green:hover{background:#157347}
+.btn-red{background:#DC2626;color:#fff}.btn-red:hover{background:#B91C1C}
+.btn-sm{padding:5px 12px;font-size:12px}
+.card{background:#fff;border-radius:12px;padding:18px;box-shadow:0 1px 3px rgba(0,0,0,.08);margin-bottom:14px}
+.card-title{font-size:15px;font-weight:700;color:#1e3a5f;margin-bottom:12px}
+.drop-zona{border:2px dashed #D1D5DB;border-radius:16px;padding:50px 20px;text-align:center;cursor:pointer;background:#fff;transition:all .2s;margin-bottom:16px}
+.drop-zona.over,.drop-zona:hover{border-color:#2E6DA4;background:#EFF6FF}
+.drop-icon{font-size:48px;margin-bottom:12px}.drop-text{font-size:16px;font-weight:600;color:#374151;margin-bottom:4px}
+.drop-sub{font-size:13px;color:#6B7280;margin-bottom:18px}
+.progress-bar{width:100%;height:6px;background:#E5E7EB;border-radius:3px;margin-top:12px;overflow:hidden}
+.progress-fill{height:100%;background:#1e3a5f;border-radius:3px;transition:width .3s}
+.filtros{display:flex;gap:10px;margin-bottom:14px;flex-wrap:wrap;align-items:center}
+input[type=text],input[type=email],input[type=password],select,textarea{padding:8px 11px;border-radius:8px;border:1px solid #D1D5DB;font-size:13px;font-family:inherit;outline:none;background:#fff}
+input:focus,select:focus,textarea:focus{border-color:#2E6DA4;box-shadow:0 0 0 2px rgba(46,109,164,.1)}
+textarea{resize:vertical;min-height:60px;width:100%}
+.tabla-wrap{background:#fff;border-radius:12px;overflow:hidden;box-shadow:0 1px 4px rgba(0,0,0,.08);margin-bottom:14px}
+.tabla-head{display:grid;grid-template-columns:75px 80px 1fr 90px 1fr 1fr 95px 120px 30px;background:#1e3a5f;padding:9px 14px;gap:8px}
+.tabla-row{display:grid;grid-template-columns:75px 80px 1fr 90px 1fr 1fr 95px 120px 30px;padding:10px 14px;gap:8px;border-bottom:1px solid #F1F5F9;cursor:pointer;align-items:center;transition:background .1s}
+.tabla-row:hover{background:#F8FAFF}.tabla-row.selected{background:#EFF6FF}
+.th{color:rgba(255,255,255,.85);font-size:9px;font-weight:600;text-transform:uppercase;letter-spacing:.04em}
+.td{font-size:12px;color:#374151;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.estado-sel{padding:3px 8px;border-radius:20px;font-size:11px;font-weight:600;border:none;cursor:pointer;font-family:inherit}
+.detalle{background:#fff;border-radius:12px;padding:20px;box-shadow:0 2px 8px rgba(0,0,0,.1);margin-top:12px}
+.detalle-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px 20px;margin-bottom:14px}
+.detalle-item{padding:5px 0;border-bottom:1px solid #F1F5F9}
+.detalle-key{font-size:10px;color:#9CA3AF;text-transform:uppercase;letter-spacing:.05em}
+.detalle-val{font-size:13px;color:#374151;font-weight:500}
+.pill{display:inline-flex;align-items:center;gap:5px;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600}
+.pill-dot{width:6px;height:6px;border-radius:50%;display:inline-block}
+#toast{position:fixed;top:14px;right:14px;padding:11px 18px;border-radius:10px;border:1px solid;font-size:13px;font-weight:600;z-index:9999;box-shadow:0 4px 12px rgba(0,0,0,.15);display:none;max-width:340px}
+#login-screen{position:fixed;inset:0;background:linear-gradient(135deg,#1e3a5f,#2E6DA4);display:flex;align-items:center;justify-content:center;z-index:2000}
+.login-card{background:#fff;border-radius:20px;padding:40px 36px;width:380px;text-align:center;box-shadow:0 24px 80px rgba(0,0,0,.3)}
+.login-icon{font-size:48px;margin-bottom:10px}
+.login-title{font-size:21px;font-weight:700;color:#1e3a5f;margin-bottom:3px}
+.login-sub{color:#6B7280;font-size:12px;margin-bottom:22px}
+.login-form{display:flex;flex-direction:column;gap:10px}
+.login-input{padding:12px 14px;border-radius:10px;border:1.5px solid #D1D5DB;font-size:14px;font-family:inherit;outline:none;text-align:left}
+.login-input:focus{border-color:#1e3a5f;box-shadow:0 0 0 3px rgba(30,58,95,.08)}
+.login-err{color:#DC2626;font-size:12px;background:#FEE2E2;padding:9px 12px;border-radius:8px;text-align:left}
+.login-ok{color:#065F46;font-size:12px;background:#D1FAE5;padding:9px 12px;border-radius:8px;text-align:left}
+.empty{text-align:center;padding:50px 20px}
+.empty-icon{font-size:40px;margin-bottom:10px}.empty-title{font-size:16px;font-weight:700;color:#374151;margin-bottom:4px}
+.empty-sub{color:#6B7280;font-size:13px;margin-bottom:16px}
+.alerta-banner{padding:11px 16px;border-radius:10px;margin-bottom:14px;font-size:13px;font-weight:600;display:none}
+.alerta-venc{background:#FEE2E2;border:1px solid #FCA5A5;color:#991B1B}
+.print-preview{background:#fff;border-radius:12px;padding:20px;box-shadow:0 1px 4px rgba(0,0,0,.08)}
+.print-header{text-align:center;border-bottom:2px solid #1e3a5f;padding-bottom:10px;margin-bottom:14px}
+.print-table{width:100%;border-collapse:collapse;font-size:11px}
+.print-table th{background:#1e3a5f;color:#fff;padding:7px 8px;text-align:left;font-size:10px}
+.print-table td{padding:6px 8px;border-bottom:1px solid #E5E7EB}
+.print-footer{margin-top:18px;padding-top:10px;border-top:1px solid #E5E7EB;display:flex;justify-content:space-between;font-size:10px;color:#9CA3AF}
+.rec-row{display:flex;align-items:center;gap:12px;padding:9px 0;border-bottom:1px solid #F1F5F9;cursor:pointer}
+.rec-row:hover{background:#F8FAFF;margin:0 -4px;padding-left:4px;border-radius:6px}
+.modal{position:fixed;inset:0;background:rgba(0,0,0,.5);display:flex;align-items:center;justify-content:center;z-index:1000;display:none}
+.modal-card{background:#fff;border-radius:16px;padding:28px;width:380px;box-shadow:0 20px 60px rgba(0,0,0,.3)}
+.modal-title{font-size:17px;font-weight:700;color:#1e3a5f;margin-bottom:16px}
+.form-group{margin-bottom:12px}
+.form-label{font-size:11px;font-weight:600;color:#6B7280;text-transform:uppercase;letter-spacing:.05em;margin-bottom:5px;display:block}
+</style>
+</head>
+<body>
+
+<!-- LOGIN -->
+<div id="login-screen">
+  <div class="login-card">
+    <div class="login-icon">🏥</div>
+    <h2 class="login-title">Recetas UHD</h2>
+    <p class="login-sub">Hospital Dr. Ernesto Torres G. · Iquique</p>
+    <div class="login-form">
+      <input class="login-input" id="l-email" type="email" placeholder="Correo institucional" onkeydown="if(event.key==='Enter')document.getElementById('l-pass').focus()">
+      <input class="login-input" id="l-pass"  type="password" placeholder="Contraseña" onkeydown="if(event.key==='Enter')doLogin()">
+      <div class="login-err" id="l-err" style="display:none"></div>
+      <button class="btn" id="l-btn" style="width:100%;padding:13px;font-size:15px" onclick="doLogin()">Ingresar al sistema</button>
+    </div>
+    <p style="color:#9CA3AF;font-size:10px;margin-top:18px">Acceso restringido al personal autorizado de UHD</p>
+  </div>
+</div>
+
+<!-- MODAL CAMBIAR CONTRASEÑA -->
+<div class="modal" id="modal-password">
+  <div class="modal-card">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:16px">
+      <div class="modal-title" style="margin-bottom:0">🔑 Cambiar contraseña</div>
+      <button onclick="document.getElementById('modal-password').style.display='none'" style="background:none;border:none;font-size:20px;cursor:pointer;color:#9CA3AF">✕</button>
+    </div>
+    <div class="form-group">
+      <label class="form-label">Contraseña actual</label>
+      <input type="password" id="pw-actual" placeholder="Contraseña actual" style="width:100%">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Nueva contraseña</label>
+      <input type="password" id="pw-nueva" placeholder="Mínimo 8 caracteres" style="width:100%">
+    </div>
+    <div class="form-group">
+      <label class="form-label">Confirmar nueva contraseña</label>
+      <input type="password" id="pw-confirmar" placeholder="Repite la nueva contraseña" style="width:100%">
+    </div>
+    <div class="login-err" id="pw-err" style="display:none;margin-bottom:10px"></div>
+    <div class="login-ok"  id="pw-ok"  style="display:none;margin-bottom:10px"></div>
+    <button class="btn" style="width:100%" onclick="cambiarPassword()">Cambiar contraseña</button>
+  </div>
+</div>
+
+<div id="toast"></div>
+
+<!-- APP -->
+<div id="app-wrap">
+  <div id="sidebar">
+    <div class="brand">
+      <span style="font-size:24px">🏥</span>
+      <div><div class="brand-title">Recetas UHD</div><div class="brand-sub">H. Dr. E. Torres G.</div></div>
+    </div>
+    <nav>
+      <button class="nav-btn active" onclick="showVista('dashboard')">◈ &nbsp;Dashboard</button>
+      <button class="nav-btn" onclick="showVista('cargar')">⊕ &nbsp;Cargar PDFs</button>
+      <button class="nav-btn" onclick="showVista('recetas')">☰ &nbsp;Recetas <span class="nav-count" id="nav-count">0</span></button>
+      <button class="nav-btn" onclick="showVista('imprimir')">⎙ &nbsp;Imprimir</button>
+      <button class="nav-btn" id="nav-admin" style="display:none" onclick="showVista('admin')">⚙ &nbsp;Admin</button>
+    </nav>
+    <div id="sync-bar"><span id="sync-status">● Conectando...</span></div>
+    <div class="sidebar-bottom">
+      <button class="btn" style="width:100%;margin-bottom:8px;font-size:13px" onclick="showVista('cargar')">+ Cargar PDF</button>
+      <div class="user-info">
+        <div class="avatar" id="sb-avatar">A</div>
+        <div style="min-width:0">
+          <div class="user-name" id="sb-name">—</div>
+          <div class="user-role" id="sb-role">—</div>
+          <div class="user-email" id="sb-email">—</div>
+        </div>
+      </div>
+      <button class="pw-btn" style="margin-bottom:6px" onclick="document.getElementById('modal-password').style.display='flex'">🔑 Cambiar contraseña</button>
+      <button class="logout-btn" onclick="doLogout()">Cerrar sesión →</button>
+    </div>
+  </div>
+
+  <div id="main">
+
+    <!-- DASHBOARD -->
+    <div id="v-dashboard">
+      <h1>Dashboard</h1>
+      <p class="sub" id="dash-fecha"></p>
+      <div class="alerta-banner alerta-venc" id="alerta-venc"></div>
+      <div class="stats-grid">
+        <div class="stat-card" style="border-top:4px solid #1e3a5f"><div class="stat-icon">📋</div><div class="stat-val" id="st-total" style="color:#1e3a5f">0</div><div class="stat-label">Total</div></div>
+        <div class="stat-card" style="border-top:4px solid #854d0e"><div class="stat-icon">⏳</div><div class="stat-val" id="st-pend" style="color:#854d0e">0</div><div class="stat-label">Pendientes</div></div>
+        <div class="stat-card" style="border-top:4px solid #14532d"><div class="stat-icon">✅</div><div class="stat-val" id="st-lista" style="color:#14532d">0</div><div class="stat-label">Listas</div></div>
+        <div class="stat-card" style="border-top:4px solid #1e3a8a"><div class="stat-icon">📦</div><div class="stat-val" id="st-ret" style="color:#1e3a8a">0</div><div class="stat-label">Retiradas</div></div>
+        <div class="stat-card" style="border-top:4px solid #7f1d1d"><div class="stat-icon">⚠️</div><div class="stat-val" id="st-venc" style="color:#7f1d1d">0</div><div class="stat-label">Vencidas</div></div>
+      </div>
+      <div class="card">
+        <div class="card-title">Últimas recetas cargadas</div>
+        <div id="dash-recetas"><div class="empty"><div class="empty-icon">📄</div><div class="empty-title">Sin recetas</div><div class="empty-sub">Carga los PDFs de YANIS para comenzar</div><button class="btn" onclick="showVista('cargar')">Cargar PDFs →</button></div></div>
+      </div>
+    </div>
+
+    <!-- CARGAR -->
+    <div id="v-cargar" style="display:none">
+      <h1>Cargar Recetas PDF</h1>
+      <p class="sub">Arrastra uno o varios PDFs de YANIS. El sistema extrae todos los datos automáticamente.</p>
+      <div class="drop-zona" id="drop-zona" ondragover="dropOver(event)" ondragleave="dropLeave()" ondrop="dropFiles(event)" onclick="document.getElementById('file-input').click()">
+        <div class="drop-icon">📄</div>
+        <div class="drop-text">Arrastra los PDFs aquí</div>
+        <div class="drop-sub">o haz clic para seleccionar — se detectan duplicados automáticamente</div>
+        <button class="btn" onclick="event.stopPropagation();document.getElementById('file-input').click()">Seleccionar PDFs</button>
+        <div class="progress-bar" id="prog-bar" style="display:none"><div class="progress-fill" id="prog-fill" style="width:0%"></div></div>
+        <p id="prog-text" style="font-size:12px;color:#6B7280;margin-top:8px;display:none"></p>
+      </div>
+      <input type="file" id="file-input" accept=".pdf" multiple style="display:none" onchange="handleFiles(this.files)">
+      <div id="carga-resultado"></div>
+    </div>
+
+    <!-- RECETAS -->
+    <div id="v-recetas" style="display:none">
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:14px">
+        <h1 style="margin-bottom:0">Recetas <span id="rec-count" style="font-size:14px;color:#6B7280;font-weight:400">(0)</span></h1>
+        <button id="btn-exportar" class="btn btn-light btn-sm" onclick="exportarJSON()">⬇ Exportar respaldo</button>
+      </div>
+      <div class="filtros">
+        <input type="text" id="f-buscar" placeholder="🔍 Paciente, médico, fármaco..." oninput="renderTabla()" style="min-width:230px">
+        <select id="f-fecha" onchange="renderTabla()"><option value="todas">📅 Todas las fechas</option></select>
+        <select id="f-estado" onchange="renderTabla()">
+          <option value="">Todos los estados</option>
+          <option>Pendiente</option><option>Lista</option><option>Retirada</option><option>Vencida</option>
+        </select>
+        <button class="btn btn-light btn-sm" onclick="limpiarFiltros()">Limpiar</button>
+      </div>
+      <div class="tabla-wrap">
+        <div class="tabla-head">
+          <div class="th">N° Receta</div><div class="th">Indicación</div><div class="th">Paciente</div>
+          <div class="th">RUT</div><div class="th">Médico</div><div class="th">Fármaco</div>
+          <div class="th">F. Cumpl.</div><div class="th">Estado</div><div class="th"></div>
+        </div>
+        <div id="tabla-body"></div>
+      </div>
+      <div id="detalle-panel" style="display:none"></div>
+    </div>
+
+    <!-- IMPRIMIR -->
+    <div id="v-imprimir" style="display:none">
+      <h1>Hoja de Impresión</h1>
+      <p class="sub">Selecciona la fecha y estado, luego presiona imprimir.</p>
+      <div class="filtros">
+        <select id="p-fecha" onchange="renderPrint()"><option value="todas">📅 Todas las fechas</option></select>
+        <select id="p-estado" onchange="renderPrint()">
+          <option value="">Todos los estados</option>
+          <option>Pendiente</option><option>Lista</option><option>Retirada</option><option>Vencida</option>
+        </select>
+        <button class="btn btn-green" style="font-size:14px;padding:10px 22px" onclick="abrirImpresion()">🖨️ Imprimir</button>
+      </div>
+      <div id="print-preview"></div>
+    </div>
+
+    <!-- ADMIN -->
+    <div id="v-admin" style="display:none">
+      <h1>Administración</h1>
+      <div class="card">
+        <div class="card-title">👥 Usuarios del sistema</div>
+        <div style="overflow-x:auto">
+          <table style="width:100%;border-collapse:collapse;font-size:13px">
+            <thead><tr style="background:#F8FAFF">
+              <th style="padding:8px 12px;text-align:left;color:#6B7280;font-size:11px;text-transform:uppercase">Email</th>
+              <th style="padding:8px 12px;text-align:left;color:#6B7280;font-size:11px;text-transform:uppercase">Nombre</th>
+              <th style="padding:8px 12px;text-align:left;color:#6B7280;font-size:11px;text-transform:uppercase">Contraseña inicial</th>
+              <th style="padding:8px 12px;text-align:left;color:#6B7280;font-size:11px;text-transform:uppercase">Rol</th>
+            </tr></thead>
+            <tbody id="tabla-usuarios"></tbody>
+          </table>
+        </div>
+        <p style="font-size:11px;color:#9CA3AF;margin-top:12px">Para agregar/eliminar usuarios ve a Firebase Console → Authentication → Users</p>
+      </div>
+      <div class="card">
+        <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+          📊 Estadísticas
+          <button class="btn btn-light btn-sm" onclick="exportarJSON()">⬇ Exportar respaldo JSON</button>
+        </div>
+        <div id="admin-stats"></div>
+      </div>
+      <div class="card" style="border-left:4px solid #F59E0B">
+        <div class="card-title">📋 Recomendaciones de operación</div>
+        <div style="font-size:12px;color:#374151;line-height:2">
+          ✅ Exportar respaldo cada semana desde "Exportar respaldo JSON"<br>
+          ✅ Cambiar contraseñas cada 3 meses desde "🔑 Cambiar contraseña" en el sidebar<br>
+          ✅ Solo el admin puede eliminar recetas y exportar datos<br>
+          ✅ Cada usuario tiene su sesión — queda registrado quién cargó cada receta<br>
+          ✅ El sistema detecta PDFs duplicados automáticamente<br>
+          ⚠️ Si un campo sale "—", reportar para ajustar el parser de YANIS
+        </div>
+      </div>
+    </div>
+
+  </div><!-- /main -->
+</div><!-- /app-wrap -->
+
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js";
+
+const COL={
+  Pendiente:{bg:"#FFF3CD",tx:"#856404",dot:"#FFC107"},
+  Lista:    {bg:"#D1E7DD",tx:"#0F5132",dot:"#198754"},
+  Retirada: {bg:"#CFE2FF",tx:"#084298",dot:"#0D6EFD"},
+  Vencida:  {bg:"#F8D7DA",tx:"#842029",dot:"#DC3545"},
+};
+
+const USUARIOS_TABLA = [
+  {email:"admin@recetasuhd.cl",      nombre:"Administrador UHD",  pass:"UHD2026*", rol:"Admin"},
+  {email:"farmacia@recetasuhd.cl",   nombre:"Farmacia UHD",       pass:"UHD2026*", rol:"Staff"},
+  {email:"enfermeria@recetasuhd.cl", nombre:"Enfermería UHD",     pass:"UHD2026*", rol:"Staff"},
+  {email:"rodriguez@recetasuhd.cl",  nombre:"Dr. Rodríguez",      pass:"UHD2026*", rol:"Médico"},
+  {email:"duke@recetasuhd.cl",       nombre:"Dra. Duke",          pass:"UHD2026*", rol:"Médico"},
+  {email:"medina@recetasuhd.cl",     nombre:"Dr. Medina",         pass:"UHD2026*", rol:"Médico"},
+  {email:"gino@recetasuhd.cl",       nombre:"Dr. Gino",           pass:"UHD2026*", rol:"Médico"},
+  {email:"cedeno@recetasuhd.cl",     nombre:"Dra. Cedeño",        pass:"UHD2026*", rol:"Médico"},
+  {email:"garces@recetasuhd.cl",     nombre:"Dr. Garcés",         pass:"UHD2026*", rol:"Médico"},
+  {email:"leandro@recetasuhd.cl",    nombre:"Dr. Leandro",        pass:"UHD2026*", rol:"Médico"},
+  {email:"sequeda@recetasuhd.cl",    nombre:"Dr. Sequeda",        pass:"UHD2026*", rol:"Médico"},
+  {email:"pacheco@recetasuhd.cl",    nombre:"Dr. Pacheco",        pass:"UHD2026*", rol:"Médico"},
+];
+
+// ── NAVEGACIÓN ─────────────────────────────────────────────────────
+function showVista(v) {
+  ["dashboard","cargar","recetas","imprimir","admin"].forEach(x=>{
+    document.getElementById("v-"+x).style.display=x===v?"block":"none";
+  });
+  document.querySelectorAll(".nav-btn").forEach(b=>b.classList.remove("active"));
+  if(v==="recetas")  renderTabla();
+  if(v==="imprimir") { actualizarFechasSelector(); renderPrint(); }
+  if(v==="admin")    renderAdmin();
+}
+
+// ── EXTRAER PDF ────────────────────────────────────────────────────
+async function extraerTextoPDF(file) {
+  const ab=await file.arrayBuffer();
+  const pdf=await pdfjsLib.getDocument({data:ab}).promise;
+  let texto="";
+  for(let i=1;i<=pdf.numPages;i++){
+    const page=await pdf.getPage(i);
+    const content=await page.getTextContent();
+    texto+=content.items.map(item=>item.str).join(" ")+"\n";
+  }
+  return texto;
+}
+
+// ── PARSER YANIS ───────────────────────────────────────────────────
+function parsear(t, archivo) {
+  // Normalizar texto: limpiar caracteres raros del PDF
+  const tn = t.replace(/[^\x00-\x7FÁÉÍÓÚÑáéíóúñÜü\s]/g, " ").replace(/\s+/g, " ");
+  const g = (txt,re) => { const m=txt.match(re); return m?m[1].trim():"—"; };
+
+  // Usar texto normalizado para extracciones
+  const numeroIndicacion  = g(tn, /REGISTRO DE INDICACIONES\s*N[\u00ba\u00b0o]?\s*[:\.]?\s*(\d+)/i);
+  const numeroReceta      = g(tn, /N[\u00fa u]mero de Receta[:\s]+(\d+)/i);
+
+  // Paciente: captura todo hasta Rut o Edad
+  let paciente = "—";
+  const _p = tn.match(/Nombre\s*:\s*([A-ZÁÉÍÓÚÑZA-Z ]{5,60})(?=Rut|Edad)/i);
+  if (_p) paciente = _p[1].replace(/\s+/g, " ").trim();
+
+  const rut               = g(tn, /Rut\s*:\s*([\d.]+-[\dkK])/i);
+  const ficha             = g(tn, /Ficha:\s*(\d+)/i);
+  const prevision         = g(tn, /Previsi[oó]n:\s*([A-ZÁÉÍÓÚÑA-Z0-9 ]{2,20})/i);
+  const fechaCreacion     = g(tn, /Fecha crea:\s*(\d{2}\/\d{2}\/\d{4})/i);
+  const servicio          = g(tn, /Servicio\s*:\s*([A-ZÁÉÍÓÚÑA-Z ]{4,40})(?=Fecha|Sexo)/i);
+  const fechaCumplimiento = g(tn, /Fecha Cumplimiento[^:]*:\s*(\d{2}\/\d{2}\/\d{4})/i);
+
+  // Médico: múltiples patrones robustos
+  let medico = "—";
+  const _medicoPatterns = [
+    /Dr\(?a?\)?\.?\s+([A-ZÁÉÍÓÚÑA-Z][A-ZÁÉÍÓÚÑA-Z .]{4,60})(?=Run)/i,
+    /Dr\(?a?\)?\.?\s+([A-ZÁÉÍÓÚÑA-Z][A-ZÁÉÍÓÚÑA-Z .]{4,60})(?=Pag|Pág)/i,
+    /Dr\(?a?\)?\.?\s+([A-ZÁÉÍÓÚÑA-Z][A-ZÁÉÍÓÚÑA-Z .]{4,60})/i,
+  ];
+  for (const pat of _medicoPatterns) {
+    const _m = tn.match(pat);
+    if (_m && _m[1] && _m[1].trim().replace(/\.+/g,"").trim().length > 3) {
+      medico = _m[1].trim().replace(/\s+/g," ");
+      break;
+    }
+  }
+
+  const run               = g(tn, /Run:\s*([\d.]+-[\dkK])/i);
+
+  // Fármacos: capturar medicamentos limpios desde tabla YANIS
+  // Estructura YANIS: NOMBRE_MEDICAMENTO   UNIDAD(FA/AM/CM)   DOSIS   FRECUENCIA...
+  // ── MEDICAMENTOS ─────────────────────────────────────────────────
+  // Patrón exacto YANIS: NOMBRE_DROGA DOSIS FORMA_FARMACEUTICA
+  // Ej: "CEFTRIAXONA 1 GR FRASCO AMPOLLA" o "ACENOCUMAROL 4 MG COMPRIMIDO"
+  let farmaco = "—";
+  let todosLosFarmacos = [];
+
+  // Aislar sección de medicamentos
+  const _mi = tn.indexOf("Medicamentos");
+  const _di = tn.search(/Dr\(?a?\)?[\. ][A-Z]/);
+  const _sec = _mi >= 0 ? tn.slice(_mi, _di > _mi ? _di : tn.length) : tn;
+
+  // Regex preciso: NOMBRE + número con unidad + forma farmacéutica
+  // Cubre casos como: "PARACETAMOL 10 MG/ML (100 ML) FRASCO AMPOLLA"
+  //                   "ACENOCUMAROL 4 MG COMPRIMIDO"
+  //                   "ENOXAPARINA 60 MG JERINGA PRE LLENADA"
+  const _re = /([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ+ -]{2,}?)\s+(\d[\d.,/]*\s*(?:MG|ML|GR|MCG|UI|%)(?:[^(]*\([^)]*\))?)\s*(FRASCO AMPOLLA|FRASCO|AMPOLLA|COMPRIMIDO|TABLETA|CAPSULA|JERINGA PRE LLENADA|JERINGA|PARCHE|SUPOSITORIO|GOTAS)/gi;
+  let _m;
+  while ((_m = _re.exec(_sec)) !== null) {
+    const _nombre = _m[1].trim().replace(/\s+/g," ");
+    const _dosis  = _m[2].trim().replace(/\s+/g," ");
+    const _forma  = _m[3].trim();
+    const _med    = `${_nombre} ${_dosis} ${_forma}`;
+    const _skip   = ["FARMACO","FÁRMACO","DOSIFICACION","FRECUENCIA","VIA "];
+    if (!_skip.some(s => _nombre.toUpperCase().startsWith(s)) && !todosLosFarmacos.includes(_med)) {
+      todosLosFarmacos.push(_med);
+    }
+  }
+
+  if (todosLosFarmacos.length > 0) farmaco = todosLosFarmacos[0];
+  const farmacoLista = todosLosFarmacos.length > 0 ? todosLosFarmacos : ["—"]
+  return {
+    id: Date.now()+"-"+Math.random(),
+    numeroIndicacion, numeroReceta, paciente, rut, ficha, prevision,
+    fechaCreacion, servicio, fechaCumplimiento, medico, run, farmaco, farmacoLista,
+    observaciones: "",
+    archivo,
+    estado: "Pendiente",
+    fechaRegistro: new Date().toLocaleDateString("es-CL"),
+    cargadoPor: window.session?.email||"—",
+  };
+}
+
+// ── CARGA ARCHIVOS ─────────────────────────────────────────────────
+function dropOver(e){e.preventDefault();document.getElementById("drop-zona").classList.add("over");}
+function dropLeave(){document.getElementById("drop-zona").classList.remove("over");}
+function dropFiles(e){e.preventDefault();dropLeave();handleFiles(e.dataTransfer.files);}
+
+async function handleFiles(files) {
+  const pdfs=[...files].filter(f=>f.name.toLowerCase().endsWith(".pdf"));
+  if(!pdfs.length){showToast("No se encontraron PDFs","warn");return;}
+  const prog=document.getElementById("prog-bar");
+  const fill=document.getElementById("prog-fill");
+  const txt=document.getElementById("prog-text");
+  prog.style.display="block"; txt.style.display="block";
+  const cargadas=[]; const duplicadas=[]; const errores=[];
+  for(let i=0;i<pdfs.length;i++){
+    txt.textContent=`Procesando ${i+1} de ${pdfs.length}: ${pdfs[i].name}`;
+    fill.style.width=((i+1)/pdfs.length*100)+"%";
+    try{
+      const t=await extraerTextoPDF(pdfs[i]);
+      const r=parsear(t,pdfs[i].name);
+      const ok=await window.guardarReceta(r);
+      if(ok) cargadas.push(r);
+      else duplicadas.push(pdfs[i].name);
+    }catch(err){
+      console.error("Error:",err);
+      errores.push(pdfs[i].name);
+    }
+  }
+  prog.style.display="none"; txt.style.display="none"; fill.style.width="0%";
+  let resumen=`<div class="card">`;
+  if(cargadas.length) resumen+=`<div class="card-title">✅ ${cargadas.length} receta(s) cargada(s)</div>`
+    +cargadas.map(r=>`<div class="rec-row">
+      <div style="flex:2"><strong>${r.paciente}</strong> <span style="color:#9CA3AF;font-size:11px">${r.rut}</span></div>
+      <div style="flex:1;font-size:12px">${r.medico}</div>
+      <div style="font-size:12px;color:#6B7280">Indicación #${r.numeroIndicacion}</div>
+    </div>`).join("");
+  if(duplicadas.length) resumen+=`<div style="margin-top:12px;padding:10px;background:#FFF3CD;border-radius:8px;font-size:12px;color:#856404">⚠️ <strong>Duplicados ignorados:</strong> ${duplicadas.join(", ")}</div>`;
+  if(errores.length)    resumen+=`<div style="margin-top:8px;padding:10px;background:#FEE2E2;border-radius:8px;font-size:12px;color:#991B1B">❌ <strong>Errores:</strong> ${errores.join(", ")}</div>`;
+  resumen+=`<br><button class="btn btn-sm" onclick="showVista('recetas')" style="margin-top:8px">Ver todas →</button></div>`;
+  document.getElementById("carga-resultado").innerHTML=resumen;
+  if(cargadas.length) showToast("✅ "+cargadas.length+" receta(s) cargada(s)");
+  document.getElementById("file-input").value="";
+}
+
+// ── SELECTORES FECHA ───────────────────────────────────────────────
+function actualizarFechasSelector(){
+  const fechas=[...new Set(window.recetas.map(r=>r.fechaCreacion))].filter(f=>f!=="—").sort().reverse();
+  ["f-fecha","p-fecha"].forEach(id=>{
+    const sel=document.getElementById(id); if(!sel)return;
+    const val=sel.value;
+    sel.innerHTML="<option value='todas'>📅 Todas las fechas</option>"+fechas.map(f=>`<option value="${f}">${f}</option>`).join("");
+    if(fechas.includes(val)) sel.value=val;
+  });
+}
+
+// ── DASHBOARD ──────────────────────────────────────────────────────
+function renderDash(){
+  const t=window.recetas.length;
+  const p=window.recetas.filter(r=>r.estado==="Pendiente").length;
+  const l=window.recetas.filter(r=>r.estado==="Lista").length;
+  const re=window.recetas.filter(r=>r.estado==="Retirada").length;
+  const v=window.recetas.filter(r=>r.estado==="Vencida").length;
+  document.getElementById("st-total").textContent=t;
+  document.getElementById("st-pend").textContent=p;
+  document.getElementById("st-lista").textContent=l;
+  document.getElementById("st-ret").textContent=re;
+  document.getElementById("st-venc").textContent=v;
+  const av=document.getElementById("alerta-venc");
+  av.style.display=v>0?"block":"none";
+  if(v>0) av.innerHTML=`⚠️ <strong>${v} receta(s) vencida(s)</strong> requieren atención urgente. <a href="#" onclick="document.getElementById('f-estado').value='Vencida';showVista('recetas')" style="color:#991B1B">Ver →</a>`;
+  const cont=document.getElementById("dash-recetas");
+  if(!t){cont.innerHTML='<div class="empty"><div class="empty-icon">📄</div><div class="empty-title">Sin recetas</div><div class="empty-sub">Carga los PDFs de YANIS para comenzar</div><button class="btn" onclick="showVista(\'cargar\')">Cargar PDFs →</button></div>';return;}
+  cont.innerHTML=window.recetas.slice(0,7).map(r=>`
+    <div class="rec-row" onclick="showVista('recetas')">
+      <div style="flex:2"><strong style="font-size:13px">${r.paciente}</strong> <span style="font-size:11px;color:#9CA3AF">${r.rut}</span></div>
+      <div style="flex:1;font-size:12px;color:#374151">${r.medico}</div>
+      <div style="flex:1;font-size:12px;color:#6B7280">#${r.numeroIndicacion}</div>
+      ${pillHTML(r.estado)}
+    </div>`).join("");
+}
+
+// ── TABLA ──────────────────────────────────────────────────────────
+function getFiltradas(){
+  const fb=(document.getElementById("f-buscar")?.value||"").toLowerCase();
+  const ff=document.getElementById("f-fecha")?.value||"todas";
+  const fe=document.getElementById("f-estado")?.value||"";
+  return window.recetas.filter(r=>{
+    if(fb && ![r.paciente,r.medico,r.farmaco,r.numeroIndicacion,r.numeroReceta].some(v=>(v||"").toLowerCase().includes(fb))) return false;
+    if(ff!=="todas"&&r.fechaCreacion!==ff) return false;
+    if(fe&&r.estado!==fe) return false;
+    return true;
+  });
+}
+
+function renderTabla(){
+  actualizarFechasSelector();
+  const filtradas=getFiltradas();
+  document.getElementById("rec-count").textContent=`(${filtradas.length})`;
+  const body=document.getElementById("tabla-body");
+  if(!filtradas.length){body.innerHTML='<div class="empty"><div class="empty-icon">🔍</div><div class="empty-title">Sin resultados</div><div class="empty-sub">Ajusta los filtros</div></div>';return;}
+  body.innerHTML=filtradas.map((r,i)=>`
+    <div class="tabla-row${window.selId===r.id?" selected":""}" id="row-${r.id}"
+      style="background:${window.selId===r.id?"#EFF6FF":i%2===0?"#fff":"#FAFAFA"}"
+      onclick="toggleDetalle('${r.id}')">
+      <div class="td" title="${r.numeroReceta}"><strong>${r.numeroReceta}</strong></div>
+      <div class="td" title="${r.numeroIndicacion}">${r.numeroIndicacion}</div>
+      <div class="td" title="${r.paciente}">${r.paciente}</div>
+      <div class="td" style="font-size:11px;color:#6B7280" title="${r.rut}">${r.rut}</div>
+      <div class="td" title="${r.medico}">${r.medico}</div>
+      <div class="td" title="${(r.farmacoLista||[r.farmaco]).join(' | ')}">
+        <span style="font-size:10px;background:#EFF6FF;color:#1e40af;padding:2px 6px;border-radius:4px">
+          ${(r.farmaco||"").substring(0,20)}${(r.farmaco||"").length>20?"…":""}
+        </span>
+        ${(r.farmacoLista||[]).length>1?`<span style="font-size:9px;background:#1e3a5f;color:#fff;border-radius:10px;padding:1px 5px;margin-left:3px">+${(r.farmacoLista.length-1)}</span>`:""}
+      </div>
+      <div class="td" style="font-size:11px">${r.fechaCumplimiento}</div>
+      <div class="td" onclick="event.stopPropagation()">
+        <select class="estado-sel" style="background:${COL[r.estado]?.bg};color:${COL[r.estado]?.tx}"
+          onchange="cambiarEstado('${r.id}',this.value)">
+          <option${r.estado==="Pendiente"?" selected":""}>Pendiente</option>
+          <option${r.estado==="Lista"?" selected":""}>Lista</option>
+          <option${r.estado==="Retirada"?" selected":""}>Retirada</option>
+          <option${r.estado==="Vencida"?" selected":""}>Vencida</option>
+        </select>
+      </div>
+      <div class="td" onclick="event.stopPropagation()">
+        ${window.session?.role==="admin"?`<button onclick="eliminar('${r.id}')" style="width:24px;height:24px;border-radius:50%;border:none;background:#FEE2E2;color:#DC2626;cursor:pointer;font-size:11px" title="Eliminar receta">✕</button>`:""}
+      </div>
+    </div>`).join("");
+  if(window.selId){
+    const r=window.recetas.find(x=>x.id===window.selId);
+    if(r) renderDetalle(r); else document.getElementById("detalle-panel").style.display="none";
+  }
+}
+
+function limpiarFiltros(){
+  document.getElementById("f-buscar").value="";
+  document.getElementById("f-fecha").value="todas";
+  document.getElementById("f-estado").value="";
+  renderTabla();
+}
+
+function toggleDetalle(id){
+  if(window.selId===id){window.selId=null;document.getElementById("detalle-panel").style.display="none";renderTabla();return;}
+  window.selId=id;
+  const r=window.recetas.find(x=>x.id===id);
+  if(r){renderDetalle(r);renderTabla();}
+}
+
+function renderDetalle(r){
+  const panel=document.getElementById("detalle-panel");
+  panel.style.display="block";
+  panel.innerHTML=`
+    <div class="detalle">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:14px">
+        <strong style="color:#1e3a5f;font-size:15px">📋 Receta #${r.numeroReceta} — Indicación #${r.numeroIndicacion}</strong>
+        <button onclick="window.selId=null;document.getElementById('detalle-panel').style.display='none';renderTabla()"
+          style="width:28px;height:28px;border-radius:50%;border:none;background:#F3F4F6;cursor:pointer;font-size:14px">✕</button>
+      </div>
+      <!-- Fechas destacadas -->
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
+        <div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:10px;padding:12px;text-align:center">
+          <div style="font-size:10px;color:#3B82F6;text-transform:uppercase;font-weight:700;letter-spacing:.05em;margin-bottom:4px">📅 Fecha Creación Receta</div>
+          <div style="font-size:18px;font-weight:700;color:#1e3a5f">${r.fechaCreacion||"—"}</div>
+        </div>
+        <div style="background:${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?"#FFF7ED":"#F0FDF4"};border:1px solid ${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?"#FED7AA":"#BBF7D0"};border-radius:10px;padding:12px;text-align:center">
+          <div style="font-size:10px;color:${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?"#EA580C":"#16A34A"};text-transform:uppercase;font-weight:700;letter-spacing:.05em;margin-bottom:4px">⏰ Fecha Cumplimiento${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?" ⚠️":""}</div>
+          <div style="font-size:18px;font-weight:700;color:${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?"#C2410C":"#14532d"}">${r.fechaCumplimiento||"—"}</div>
+        </div>
+      </div>
+      <!-- Medicamentos destacados -->
+      <div style="background:#F8FAFF;border:1px solid #DBEAFE;border-radius:10px;padding:12px;margin-bottom:14px">
+        <div style="font-size:10px;color:#1D4ED8;text-transform:uppercase;font-weight:700;letter-spacing:.05em;margin-bottom:8px">💊 Medicamentos</div>
+        ${(r.farmacoLista||[r.farmaco]).map((f,i)=>`
+          <div style="display:flex;align-items:center;gap:8px;padding:6px 0;${i>0?"border-top:1px solid #DBEAFE":""}">
+            <span style="background:#1e3a5f;color:#fff;border-radius:50%;width:20px;height:20px;display:flex;align-items:center;justify-content:center;font-size:10px;font-weight:700;flex-shrink:0">${i+1}</span>
+            <span style="font-size:12px;font-weight:600;color:#1e3a5f">${f}</span>
+          </div>`).join("")}
+      </div>
+      <!-- Datos del paciente y médico -->
+      <div class="detalle-grid">
+        ${[["Paciente",r.paciente],["RUT",r.rut],["Médico",r.medico],["RUN médico",r.run],
+           ["N° Indicación",r.numeroIndicacion],["N° Receta",r.numeroReceta],
+           ["Ficha",r.ficha],["Previsión",r.prevision],["Servicio",r.servicio],
+           ["Cargado por",r.cargadoPor||"—"],["F. Registro",r.fechaRegistro],
+           ["Última modificación",r.ultimaModificacion?r.ultimaModificacion.substring(0,10):"—"],
+           ["Modificado por",r.modificadoPor||"—"]
+          ].map(([k,v])=>`<div class="detalle-item"><div class="detalle-key">${k}</div><div class="detalle-val">${v||"—"}</div></div>`).join("")}
+      </div>
+      <div style="margin-top:4px">
+        <label class="form-label" style="font-size:10px;color:#9CA3AF;text-transform:uppercase;letter-spacing:.05em;display:block;margin-bottom:5px">Observaciones</label>
+        <textarea id="obs-${r.id}" placeholder="Agrega observaciones o notas sobre esta receta...">${r.observaciones||""}</textarea>
+        <button class="btn btn-sm" style="margin-top:8px" onclick="guardarObservacion('${r.id}',document.getElementById('obs-${r.id}').value)">💾 Guardar observación</button>
+      </div>
+    </div>`;
+}
+
+// ── IMPRIMIR ───────────────────────────────────────────────────────
+function getPrintFiltered(){
+  const ff=document.getElementById("p-fecha")?.value||"todas";
+  const fe=document.getElementById("p-estado")?.value||"";
+  return window.recetas.filter(r=>{
+    if(ff!=="todas"&&r.fechaCreacion!==ff) return false;
+    if(fe&&r.estado!==fe) return false;
+    return true;
+  });
+}
+
+function renderPrint(){
+  const filas=getPrintFiltered();
+  const ff=document.getElementById("p-fecha")?.value||"todas";
+  const fe=document.getElementById("p-estado")?.value||"";
+  const prev=document.getElementById("print-preview");
+  if(!filas.length){prev.innerHTML='<div class="empty"><div class="empty-icon">📅</div><div class="empty-title">Sin recetas para esta selección</div></div>';return;}
+  prev.innerHTML=`<div class="print-preview">
+    <div class="print-header">
+      <div style="font-weight:700;font-size:14px;color:#1e3a5f">HOSPITAL DR. ERNESTO TORRES GALDAMES — IQUIQUE</div>
+      <div style="font-size:12px;color:#374151;margin-top:2px">CONTROL DE RECETAS — UNIDAD HOSPITALIZACIÓN DOMICILIARIA (UHD)</div>
+      <div style="font-size:11px;color:#6B7280;margin-top:3px">${ff==="todas"?"Todas las fechas":ff}${fe?" · "+fe:""} · ${filas.length} receta(s) · ${new Date().toLocaleString("es-CL")}</div>
+    </div>
+    <table class="print-table">
+      <thead><tr><th>#</th><th>N° Receta</th><th>N° Indicación</th><th>Paciente</th><th>RUT</th><th>Médico</th><th style="min-width:180px">Medicamentos</th><th>F. Creación</th><th>F. Cumplimiento</th><th>Estado</th></tr></thead>
+      <tbody>${filas.map((r,i)=>`<tr style="background:${i%2===0?"#F8F9FA":"#fff"}">
+        <td>${i+1}</td><td><strong>${r.numeroReceta}</strong></td><td>${r.numeroIndicacion}</td>
+        <td>${r.paciente}</td><td>${r.rut}</td><td>${r.medico}</td>
+        <td>${(r.farmacoLista&&r.farmacoLista.length>0&&r.farmacoLista[0]!="—"?r.farmacoLista:[r.farmaco||"—"]).filter(f=>{if(f==="—")return true;const n=f.split(/\s+\d/)[0].trim();const l=n.replace(/[^a-zA-ZáéíóúñÁÉÍÓÚÑ]/g,"");return l.length>0&&l===l.toUpperCase();}).map((f,i)=>`<b style="color:#B91C1C;display:block">${f}</b>`).join("")}</td><td>${r.fechaCreacion}</td><td style="color:${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?"#C2410C":"inherit"};font-weight:${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?"700":"400"}">${r.fechaCumplimiento}${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?" ⚠️":""}</td>
+        <td style="background:${COL[r.estado]?.bg};color:${COL[r.estado]?.tx};font-weight:600">${r.estado}</td>
+      </tr>`).join("")}</tbody>
+    </table>
+    <div class="print-footer"><span>Firma responsable: ___________________________</span><span>UHD · ${new Date().toLocaleDateString("es-CL")}</span></div>
+  </div>`;
+}
+
+function abrirImpresion(){
+  const filas=getPrintFiltered();
+  if(!filas.length){showToast("No hay recetas para imprimir","warn");return;}
+  const ff=document.getElementById("p-fecha")?.value||"todas";
+  const fe=document.getElementById("p-estado")?.value||"";
+  const rows=filas.map((r,i)=>`<tr style="background:${i%2===0?"#f8f9fa":"#fff"}">
+    <td>${i+1}</td><td><b>${r.numeroReceta}</b></td><td>${r.numeroIndicacion}</td>
+    <td>${r.paciente}</td><td>${r.rut}</td><td>${r.medico}</td>
+    <td style="font-size:10px">${(r.farmacoLista&&r.farmacoLista.length>0&&r.farmacoLista[0]!="—"?r.farmacoLista:[r.farmaco||"—"]).filter(f=>{if(f==="—")return true;const n=f.split(/\s+\d/)[0].trim();const l=n.replace(/[^a-zA-ZáéíóúñÁÉÍÓÚÑ]/g,"");return l.length>0&&l===l.toUpperCase();}).map(f=>`<b style="color:#B91C1C;display:block;text-decoration:underline">${f}</b>`).join("")}</td><td>${r.fechaCreacion}</td><td style="color:${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?"#C2410C":"inherit"};font-weight:${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?"700":"400"}">${r.fechaCumplimiento}${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?" ⚠️":""}</td>
+    <td style="font-weight:600;background:${COL[r.estado]?.bg};color:${COL[r.estado]?.tx}">${r.estado}</td>
+  </tr>`).join("");
+  const html=`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Control Recetas UHD</title>
+  <style>body{font-family:Arial,sans-serif;font-size:11px;margin:24px}h2{text-align:center;font-size:14px}
+  .sub{text-align:center;font-size:11px;color:#555;margin-bottom:14px}
+  table{width:100%;border-collapse:collapse}th{background:#1e3a5f;color:#fff;padding:7px 8px;text-align:left;font-size:10px}
+  td{padding:6px 8px;border-bottom:1px solid #ddd}
+  .footer{margin-top:20px;display:flex;justify-content:space-between;font-size:10px;color:#888;border-top:1px solid #ccc;padding-top:8px}
+  @media print{.no-print{display:none}}</style></head><body>
+  <h2>HOSPITAL DR. ERNESTO TORRES GALDAMES — IQUIQUE</h2>
+  <div class="sub">CONTROL DE RECETAS — UHD · ${ff==="todas"?"Todas las fechas":ff}${fe?" · "+fe:""} · <b>${filas.length}</b> receta(s) · ${new Date().toLocaleString("es-CL")}</div>
+  <table><thead><tr><th>#</th><th>N° Receta</th><th>N° Indicación</th><th>Paciente</th><th>RUT</th><th>Médico</th><th style="min-width:180px">Medicamentos</th><th>F.Creación</th><th>F.Cumplimiento</th><th>Estado</th></tr></thead>
+  <tbody>${rows}</tbody></table>
+  <div class="footer"><span>Firma: ___________________________</span><span>UHD — Hospital Dr. E. Torres G. · Iquique</span></div>
+  <br><button class="no-print" onclick="window.print()" style="padding:9px 22px;background:#1e3a5f;color:#fff;border:none;border-radius:6px;cursor:pointer;font-size:14px">🖨️ Imprimir</button>
+  </body></html>`;
+  const w=window.open("","_blank","width=980,height=700");
+  if(!w){alert("Activa las ventanas emergentes para imprimir.");return;}
+  w.document.write(html);w.document.close();w.focus();
+}
+
+// ── ADMIN ──────────────────────────────────────────────────────────
+function renderAdmin(){
+  document.getElementById("tabla-usuarios").innerHTML=USUARIOS_TABLA.map((u,i)=>`
+    <tr style="background:${i%2===0?"#fff":"#F8FAFF"}">
+      <td style="padding:9px 12px;font-size:12px;color:#374151">${u.email}</td>
+      <td style="padding:9px 12px;font-size:12px;font-weight:600">${u.nombre}</td>
+      <td style="padding:9px 12px;font-size:12px;font-family:monospace;color:#6B7280">${u.pass}</td>
+      <td style="padding:9px 12px"><span style="padding:3px 10px;border-radius:20px;font-size:11px;font-weight:700;background:${u.rol==="Admin"?"#1e3a5f":"#D1E7DD"};color:${u.rol==="Admin"?"#fff":"#0F5132"}">${u.rol}</span></td>
+    </tr>`).join("");
+  const medicos=[...new Set(window.recetas.map(r=>r.medico))].filter(m=>m!=="—");
+  document.getElementById("admin-stats").innerHTML=[
+    ["Total recetas",window.recetas.length,"#1e3a5f"],
+    ["Pendientes",window.recetas.filter(r=>r.estado==="Pendiente").length,"#856404"],
+    ["Listas",window.recetas.filter(r=>r.estado==="Lista").length,"#0F5132"],
+    ["Retiradas",window.recetas.filter(r=>r.estado==="Retirada").length,"#084298"],
+    ["Vencidas",window.recetas.filter(r=>r.estado==="Vencida").length,"#842029"],
+    ["Médicos con recetas",medicos.length,"#374151"],
+  ].map(([l,v,c])=>`<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #F1F5F9;font-size:13px"><span>${l}</span><strong style="color:${c}">${v}</strong></div>`).join("");
+}
+
+// ── HELPERS ────────────────────────────────────────────────────────
+function updateNavCount(){document.getElementById("nav-count").textContent=window.recetas.length;}
+function pillHTML(e){const c=COL[e]||{};return `<span class="pill" style="background:${c.bg};color:${c.tx}"><span class="pill-dot" style="background:${c.dot}"></span>${e}</span>`;}
+function showToast(msg,tipo="ok"){
+  const t=document.getElementById("toast");
+  t.textContent=msg;
+  t.style.background=tipo==="warn"?"#FFF3CD":"#DCFCE7";
+  t.style.borderColor=tipo==="warn"?"#FFC107":"#16A34A";
+  t.style.display="block";
+  setTimeout(()=>t.style.display="none",4000);
+}
+</script>
+</body>
+</html>
