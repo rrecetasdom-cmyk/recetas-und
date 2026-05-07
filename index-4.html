@@ -25,9 +25,6 @@ const app  = initializeApp(firebaseConfig);
 const db   = getFirestore(app);
 const auth = getAuth(app);
 
-// ── ROLES Y USUARIOS ──────────────────────────────────────────────
-// Contraseña inicial para todos: UHD2026*
-// Cada usuario puede cambiarla desde su perfil
 const ROLES = {
   "admin@recetasuhd.cl":       { role:"admin", nombre:"Administrador UHD",  tipo:"admin" },
   "farmacia@recetasuhd.cl":    { role:"staff", nombre:"Farmacia UHD",       tipo:"staff" },
@@ -133,11 +130,15 @@ window.cambiarPassword = async function() {
   }
 };
 
-// ── SYNC FIRESTORE ─────────────────────────────────────────────────
+// ── SYNC FIRESTORE — PASO 1: solo estados activos ──────────────────
 function iniciarSync() {
   if (unsubscribe) unsubscribe();
   setSyncStatus("conectando");
-  const q = query(collection(db,"recetas"), orderBy("fechaRegistroTs","desc"));
+  const q = query(
+    collection(db, "recetas"),
+    where("estado", "in", ["Pendiente", "Lista", "Vencida"]),
+    orderBy("fechaRegistroTs", "desc")
+  );
   unsubscribe = onSnapshot(q, (snap) => {
     window.recetas = snap.docs.map(d=>({...d.data(), _docId:d.id}));
     actualizarFechasSelector();
@@ -156,7 +157,6 @@ function setSyncStatus(e) {
 
 // ── GUARDAR RECETA ─────────────────────────────────────────────────
 window.guardarReceta = async function(receta) {
-  // Verificar duplicado por N° Indicación
   const existe = window.recetas.find(r => r.numeroIndicacion === receta.numeroIndicacion && receta.numeroIndicacion !== "—");
   if (existe) {
     showToast("⚠️ Indicación #"+receta.numeroIndicacion+" ya existe en el sistema","warn");
@@ -495,6 +495,18 @@ textarea{resize:vertical;min-height:60px;width:100%}
         </div>
         <div id="admin-stats"></div>
       </div>
+      <div class="card" style="border-left:4px solid #1e3a8a">
+        <div class="card-title" style="display:flex;justify-content:space-between;align-items:center">
+          📦 Historial de Recetas Retiradas
+          <button class="btn btn-light btn-sm" onclick="verRetiradas()">Ver historial</button>
+        </div>
+        <p style="font-size:12px;color:#6B7280;margin-bottom:10px">
+          Las recetas retiradas se guardan aquí. Solo visibles para el administrador.
+        </p>
+        <div id="panel-retiradas" style="display:none">
+          <div id="lista-retiradas"></div>
+        </div>
+      </div>
       <div class="card" style="border-left:4px solid #F59E0B">
         <div class="card-title">📋 Recomendaciones de operación</div>
         <div style="font-size:12px;color:#374151;line-height:2">
@@ -562,15 +574,12 @@ async function extraerTextoPDF(file) {
 
 // ── PARSER YANIS ───────────────────────────────────────────────────
 function parsear(t, archivo) {
-  // Normalizar texto: limpiar caracteres raros del PDF
   const tn = t.replace(/[^\x00-\x7FÁÉÍÓÚÑáéíóúñÜü\s]/g, " ").replace(/\s+/g, " ");
   const g = (txt,re) => { const m=txt.match(re); return m?m[1].trim():"—"; };
 
-  // Usar texto normalizado para extracciones
   const numeroIndicacion  = g(tn, /REGISTRO DE INDICACIONES\s*N[\u00ba\u00b0o]?\s*[:\.]?\s*(\d+)/i);
   const numeroReceta      = g(tn, /N[\u00fa u]mero de Receta[:\s]+(\d+)/i);
 
-  // Paciente: captura todo hasta Rut o Edad
   let paciente = "—";
   const _p = tn.match(/Nombre\s*:\s*([A-ZÁÉÍÓÚÑZA-Z ]{5,60})(?=Rut|Edad)/i);
   if (_p) paciente = _p[1].replace(/\s+/g, " ").trim();
@@ -582,7 +591,6 @@ function parsear(t, archivo) {
   const servicio          = g(tn, /Servicio\s*:\s*([A-ZÁÉÍÓÚÑA-Z ]{4,40})(?=Fecha|Sexo)/i);
   const fechaCumplimiento = g(tn, /Fecha Cumplimiento[^:]*:\s*(\d{2}\/\d{2}\/\d{4})/i);
 
-  // Médico: múltiples patrones robustos
   let medico = "—";
   const _medicoPatterns = [
     /Dr\(?a?\)?\.?\s+([A-ZÁÉÍÓÚÑA-Z][A-ZÁÉÍÓÚÑA-Z .]{4,60})(?=Run)/i,
@@ -597,40 +605,37 @@ function parsear(t, archivo) {
     }
   }
 
-  const run               = g(tn, /Run:\s*([\d.]+-[\dkK])/i);
+  const run = g(tn, /Run:\s*([\d.]+-[\dkK])/i);
 
-  // Fármacos: capturar medicamentos limpios desde tabla YANIS
-  // Estructura YANIS: NOMBRE_MEDICAMENTO   UNIDAD(FA/AM/CM)   DOSIS   FRECUENCIA...
-  // ── MEDICAMENTOS ─────────────────────────────────────────────────
-  // Patrón exacto YANIS: NOMBRE_DROGA DOSIS FORMA_FARMACEUTICA
-  // Ej: "CEFTRIAXONA 1 GR FRASCO AMPOLLA" o "ACENOCUMAROL 4 MG COMPRIMIDO"
   let farmaco = "—";
   let todosLosFarmacos = [];
 
-  // Aislar sección de medicamentos
-  const _mi = tn.indexOf("Medicamentos");
-  const _di = tn.search(/Dr\(?a?\)?[\. ][A-Z]/);
+  const _hdrMed = tn.match(/\bMedicamentos?\b/i);
+  const _mi = _hdrMed ? _hdrMed.index : -1;
+  const _di = tn.search(/Dr\(?a?\)?[\. ][A-ZÁÉÍÓÚÑ]/);
   const _sec = _mi >= 0 ? tn.slice(_mi, _di > _mi ? _di : tn.length) : tn;
 
-  // Regex preciso: NOMBRE + número con unidad + forma farmacéutica
-  // Cubre casos como: "PARACETAMOL 10 MG/ML (100 ML) FRASCO AMPOLLA"
-  //                   "ACENOCUMAROL 4 MG COMPRIMIDO"
-  //                   "ENOXAPARINA 60 MG JERINGA PRE LLENADA"
-  const _re = /([A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ+ -]{2,}?)\s+(\d[\d.,/]*\s*(?:MG|ML|GR|MCG|UI|%)(?:[^(]*\([^)]*\))?)\s*(FRASCO AMPOLLA|FRASCO|AMPOLLA|COMPRIMIDO|TABLETA|CAPSULA|JERINGA PRE LLENADA|JERINGA|PARCHE|SUPOSITORIO|GOTAS)/gi;
+  const _re = /(?<![A-ZÁÉÍÓÚÑ])(?:((?:(?!(?:HORAS?|SC|ORAL|SUBCUTANEO|CADA|COMP|DIAS?|DOSIS|FRECUENCIA|PERIODO|V[IÍ]A|F[ÁA]RMACO|UN|ADMINISTRAR|ESQUEMA|INTRAVENOS[AO]|INTRAMUSCULAR|SUBCUTANEO|ENDOVENOS[AO]|MEDICAMENTOS?)\b)[A-ZÁÉÍÓÚÑ]{2,})(?:[ \t]+(?:(?!(?:HORAS?|SC|ORAL|SUBCUTANEO|CADA|COMP|DIAS?|DOSIS|FRECUENCIA|PERIODO|V[IÍ]A|F[ÁA]RMACO|UN|ADMINISTRAR|ESQUEMA|INTRAVENOS[AO]|INTRAMUSCULAR|SUBCUTANEO|ENDOVENOS[AO]|MEDICAMENTOS?)\b)[A-ZÁÉÍÓÚÑ]{2,})){0,7})[ \t]+(\d[\d.,]*\s*(?:MG|ML|MCG|GR|G|UI|%)(?:\s*\/\s*(?:\d[\d.,]*\s*)?(?:MG|ML|MCG|GR|G|UI|%))?(?:\s*\([^)]*\))?\.?)[ \t]+(JERINGA[ \t]+PRE[ \t]+LLENADA|FRASCO[ \t]+AMPOLLA|FRASCO|AMPOLLA|COMPRIMIDO|TABLETA|CAPSULA|JERINGA|PARCHE|SUPOSITORIO|GOTAS)[ \t]+(?:UD|CM|FA|AM)\b|((?:(?!(?:HORAS?|SC|ORAL|SUBCUTANEO|CADA|COMP|DIAS?|DOSIS|FRECUENCIA|PERIODO|V[IÍ]A|F[ÁA]RMACO|UN|ADMINISTRAR|ESQUEMA|INTRAVENOS[AO]|INTRAMUSCULAR|SUBCUTANEO|ENDOVENOS[AO]|MEDICAMENTOS?)\b)[A-ZÁÉÍÓÚÑ]{2,})(?:[ \t]+(?:(?!(?:HORAS?|SC|ORAL|SUBCUTANEO|CADA|COMP|DIAS?|DOSIS|FRECUENCIA|PERIODO|V[IÍ]A|F[ÁA]RMACO|UN|ADMINISTRAR|ESQUEMA|INTRAVENOS[AO]|INTRAMUSCULAR|SUBCUTANEO|ENDOVENOS[AO]|MEDICAMENTOS?)\b)[A-ZÁÉÍÓÚÑ]{2,})){0,7})[ \t]+(\d[\d.,]*\s*(?:MG|ML|MCG|GR|G|UI|%)(?:\s*\/\s*(?:\d[\d.,]*\s*)?(?:MG|ML|MCG|GR|G|UI|%))?(?:\s*\([^)]*\))?\.?)[ \t]+(?:UD|CM|FA|AM)\b|((?!\b(?:HORA|HORAS?|DIA|DIAS?)\b)(?=(?:(?!\/).)*\/[ \t]*[A-ZÁÉÍÓÚÑ]{2,}\d)(?!(?:INTRAVENOS[AO]|INTRAMUSCULAR|SUBCUTANEO|ENDOVENOS[AO])\b)(?<![(;])[A-ZÁÉÍÓÚÑ][A-ZÁÉÍÓÚÑ0-9\/() ]{5,120}?[ \t]+(?:AMPOLLA|\bAMP\b))[ \t]+AM\b)/giu;
   let _m;
+  _re.lastIndex = 0;
   while ((_m = _re.exec(_sec)) !== null) {
-    const _nombre = _m[1].trim().replace(/\s+/g," ");
-    const _dosis  = _m[2].trim().replace(/\s+/g," ");
-    const _forma  = _m[3].trim();
-    const _med    = `${_nombre} ${_dosis} ${_forma}`;
-    const _skip   = ["FARMACO","FÁRMACO","DOSIFICACION","FRECUENCIA","VIA "];
-    if (!_skip.some(s => _nombre.toUpperCase().startsWith(s)) && !todosLosFarmacos.includes(_med)) {
+    const _trimDosis = (d) => (d || "").trim().replace(/\s+/g, " ").replace(/\.$/, "");
+    const _especial = _m[6];
+    const _soloUnidad = _m[4];
+    const _med = _especial
+      ? _especial.trim().replace(/\s+/g, " ")
+      : _soloUnidad
+      ? `${_m[4].trim().replace(/\s+/g, " ")} ${_trimDosis(_m[5])}`
+      : `${_m[1].trim().replace(/\s+/g, " ")} ${_trimDosis(_m[2])} ${_m[3].trim().replace(/\s+/g, " ")}`;
+    const _skip = ["FARMACO","FÁRMACO","DOSIFICACION","FRECUENCIA","VIA ","MEDICAMENTO"];
+    const _nombreBase = (_especial ? _especial : _soloUnidad ? _m[4] : _m[1]).trim().replace(/\s+/g, " ");
+    if (!_skip.some(s => _nombreBase.toUpperCase().startsWith(s)) && !todosLosFarmacos.includes(_med)) {
       todosLosFarmacos.push(_med);
     }
   }
 
   if (todosLosFarmacos.length > 0) farmaco = todosLosFarmacos[0];
-  const farmacoLista = todosLosFarmacos.length > 0 ? todosLosFarmacos : ["—"]
+  const farmacoLista = todosLosFarmacos.length > 0 ? todosLosFarmacos : ["—"];
   return {
     id: Date.now()+"-"+Math.random(),
     numeroIndicacion, numeroReceta, paciente, rut, ficha, prevision,
@@ -801,7 +806,6 @@ function renderDetalle(r){
         <button onclick="window.selId=null;document.getElementById('detalle-panel').style.display='none';renderTabla()"
           style="width:28px;height:28px;border-radius:50%;border:none;background:#F3F4F6;cursor:pointer;font-size:14px">✕</button>
       </div>
-      <!-- Fechas destacadas -->
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:14px">
         <div style="background:#EFF6FF;border:1px solid #BFDBFE;border-radius:10px;padding:12px;text-align:center">
           <div style="font-size:10px;color:#3B82F6;text-transform:uppercase;font-weight:700;letter-spacing:.05em;margin-bottom:4px">📅 Fecha Creación Receta</div>
@@ -812,7 +816,6 @@ function renderDetalle(r){
           <div style="font-size:18px;font-weight:700;color:${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?"#C2410C":"#14532d"}">${r.fechaCumplimiento||"—"}</div>
         </div>
       </div>
-      <!-- Medicamentos destacados -->
       <div style="background:#F8FAFF;border:1px solid #DBEAFE;border-radius:10px;padding:12px;margin-bottom:14px">
         <div style="font-size:10px;color:#1D4ED8;text-transform:uppercase;font-weight:700;letter-spacing:.05em;margin-bottom:8px">💊 Medicamentos</div>
         ${(r.farmacoLista||[r.farmaco]).map((f,i)=>`
@@ -821,7 +824,6 @@ function renderDetalle(r){
             <span style="font-size:12px;font-weight:600;color:#1e3a5f">${f}</span>
           </div>`).join("")}
       </div>
-      <!-- Datos del paciente y médico -->
       <div class="detalle-grid">
         ${[["Paciente",r.paciente],["RUT",r.rut],["Médico",r.medico],["RUN médico",r.run],
            ["N° Indicación",r.numeroIndicacion],["N° Receta",r.numeroReceta],
@@ -838,6 +840,37 @@ function renderDetalle(r){
       </div>
     </div>`;
 }
+
+// ── VER RETIRADAS (historial en Admin) ─────────────────────────────
+window.verRetiradas = async function() {
+  const panel = document.getElementById("panel-retiradas");
+  const lista  = document.getElementById("lista-retiradas");
+  lista.innerHTML = '<p style="color:#6B7280;font-size:13px">Cargando historial...</p>';
+  panel.style.display = "block";
+  try {
+    const snap = await getDocs(
+      query(collection(window.db, "recetas"), where("estado","==","Retirada"), orderBy("fechaRegistroTs","desc"))
+    );
+    if (snap.empty) {
+      lista.innerHTML = '<p style="color:#6B7280;font-size:13px;padding:10px 0">No hay recetas retiradas aún.</p>';
+      return;
+    }
+    lista.innerHTML = snap.docs.map(d => {
+      const r = d.data();
+      return `<div style="padding:10px 0;border-bottom:1px solid #F1F5F9;font-size:12px;display:flex;justify-content:space-between;align-items:center">
+        <div>
+          <strong style="color:#1e3a5f">${r.paciente||"—"}</strong>
+          <span style="color:#9CA3AF;margin-left:6px">${r.rut||""}</span><br>
+          <span style="color:#374151">${r.farmaco||"—"}</span>
+          <span style="color:#9CA3AF;margin-left:6px">#${r.numeroIndicacion||"—"}</span>
+        </div>
+        <span style="color:#084298;font-size:11px;white-space:nowrap;margin-left:12px">${r.fechaRegistro||"—"}</span>
+      </div>`;
+    }).join("");
+  } catch(e) {
+    lista.innerHTML = '<p style="color:#DC2626;font-size:13px">Error al cargar historial.</p>';
+  }
+};
 
 // ── IMPRIMIR ───────────────────────────────────────────────────────
 function getPrintFiltered(){
@@ -867,7 +900,7 @@ function renderPrint(){
       <tbody>${filas.map((r,i)=>`<tr style="background:${i%2===0?"#F8F9FA":"#fff"}">
         <td>${i+1}</td><td><strong>${r.numeroReceta}</strong></td><td>${r.numeroIndicacion}</td>
         <td>${r.paciente}</td><td>${r.rut}</td><td>${r.medico}</td>
-        <td>${(r.farmacoLista&&r.farmacoLista.length>0&&r.farmacoLista[0]!="—"?r.farmacoLista:[r.farmaco||"—"]).filter(f=>{if(f==="—")return true;const n=f.split(/\s+\d/)[0].trim();const l=n.replace(/[^a-zA-ZáéíóúñÁÉÍÓÚÑ]/g,"");return l.length>0&&l===l.toUpperCase();}).map((f,i)=>`<b style="color:#B91C1C;display:block">${f}</b>`).join("")}</td><td>${r.fechaCreacion}</td><td style="color:${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?"#C2410C":"inherit"};font-weight:${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?"700":"400"}">${r.fechaCumplimiento}${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?" ⚠️":""}</td>
+        <td>${(r.farmacoLista&&r.farmacoLista.length>0&&r.farmacoLista[0]!="—"?r.farmacoLista:[r.farmaco||"—"]).map((f,i)=>`<b style="color:#B91C1C;display:block">${f}</b>`).join("")}</td><td>${r.fechaCreacion}</td><td style="color:${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?"#C2410C":"inherit"};font-weight:${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?"700":"400"}">${r.fechaCumplimiento}${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?" ⚠️":""}</td>
         <td style="background:${COL[r.estado]?.bg};color:${COL[r.estado]?.tx};font-weight:600">${r.estado}</td>
       </tr>`).join("")}</tbody>
     </table>
@@ -883,7 +916,7 @@ function abrirImpresion(){
   const rows=filas.map((r,i)=>`<tr style="background:${i%2===0?"#f8f9fa":"#fff"}">
     <td>${i+1}</td><td><b>${r.numeroReceta}</b></td><td>${r.numeroIndicacion}</td>
     <td>${r.paciente}</td><td>${r.rut}</td><td>${r.medico}</td>
-    <td style="font-size:10px">${(r.farmacoLista&&r.farmacoLista.length>0&&r.farmacoLista[0]!="—"?r.farmacoLista:[r.farmaco||"—"]).filter(f=>{if(f==="—")return true;const n=f.split(/\s+\d/)[0].trim();const l=n.replace(/[^a-zA-ZáéíóúñÁÉÍÓÚÑ]/g,"");return l.length>0&&l===l.toUpperCase();}).map(f=>`<b style="color:#B91C1C;display:block;text-decoration:underline">${f}</b>`).join("")}</td><td>${r.fechaCreacion}</td><td style="color:${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?"#C2410C":"inherit"};font-weight:${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?"700":"400"}">${r.fechaCumplimiento}${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?" ⚠️":""}</td>
+    <td style="font-size:10px">${(r.farmacoLista&&r.farmacoLista.length>0&&r.farmacoLista[0]!="—"?r.farmacoLista:[r.farmaco||"—"]).map(f=>`<b style="color:#B91C1C;display:block;text-decoration:underline">${f}</b>`).join("")}</td><td>${r.fechaCreacion}</td><td style="color:${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?"#C2410C":"inherit"};font-weight:${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?"700":"400"}">${r.fechaCumplimiento}${r.fechaCumplimiento&&r.fechaCreacion&&r.fechaCumplimiento!==r.fechaCreacion?" ⚠️":""}</td>
     <td style="font-weight:600;background:${COL[r.estado]?.bg};color:${COL[r.estado]?.tx}">${r.estado}</td>
   </tr>`).join("");
   const html=`<!DOCTYPE html><html lang="es"><head><meta charset="UTF-8"><title>Control Recetas UHD</title>
@@ -916,10 +949,9 @@ function renderAdmin(){
     </tr>`).join("");
   const medicos=[...new Set(window.recetas.map(r=>r.medico))].filter(m=>m!=="—");
   document.getElementById("admin-stats").innerHTML=[
-    ["Total recetas",window.recetas.length,"#1e3a5f"],
+    ["Total recetas activas",window.recetas.length,"#1e3a5f"],
     ["Pendientes",window.recetas.filter(r=>r.estado==="Pendiente").length,"#856404"],
     ["Listas",window.recetas.filter(r=>r.estado==="Lista").length,"#0F5132"],
-    ["Retiradas",window.recetas.filter(r=>r.estado==="Retirada").length,"#084298"],
     ["Vencidas",window.recetas.filter(r=>r.estado==="Vencida").length,"#842029"],
     ["Médicos con recetas",medicos.length,"#374151"],
   ].map(([l,v,c])=>`<div style="display:flex;justify-content:space-between;padding:8px 0;border-bottom:1px solid #F1F5F9;font-size:13px"><span>${l}</span><strong style="color:${c}">${v}</strong></div>`).join("");
